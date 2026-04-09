@@ -21,35 +21,57 @@ An AI-powered platform that crawls, curates, and synthesizes AI news from across
 
 ### 1. Agents (The Brain)
 
-| Agent | Role |
-|-------|------|
-| **Crawler Agent** | Fetches content from sources on a schedule, extracts clean text from HTML/RSS, normalizes to canonical schema (title, author, published_at, plain-text body, URL, content hash) |
-| **Curator Agent** | Reads raw content, scores relevance (1-10), extracts key claims, tags topics |
-| **Synthesizer Agent** | Generates daily/weekly digests, answers questions by pulling from memory |
+Build a **reusable agent framework from scratch**, then implement three concrete agents on top of it.
 
-Each agent is an autonomous unit with a defined role, tools it can call, and a decision loop. This teaches you the core agent pattern: **perceive → reason → act → reflect**.
+**Agent Framework (you build this):**
+- `BaseAgent` abstract class with lifecycle hooks: `perceive()` → `reason()` → `act()` → `reflect()`
+- **Tool registry** — agents declare tools they can call (search, store, fetch, compare). Tools are Python functions with typed inputs/outputs, registered via decorator.
+- **Message bus** — agents communicate via typed messages, not direct function calls. The Crawler Agent emits `ArticleCrawled` messages, the Curator Agent listens and emits `ArticleCurated`, the Synthesizer consumes curated articles.
+- **Decision logging** — every agent decision (what it perceived, what it decided, what it did, what it learned) is logged for observability and debugging.
+
+**Concrete Agents:**
+
+| Agent | Role | Tools It Uses |
+|-------|------|---------------|
+| **Crawler Agent** | Fetches content, extracts text, normalizes to canonical schema | `fetch_url`, `extract_text`, `store_article`, `check_duplicate` |
+| **Curator Agent** | Scores relevance, extracts claims, tags topics | `search_related`, `check_duplicate_topic`, `call_llm`, `store_curation` |
+| **Synthesizer Agent** | Generates digests, answers questions | `search_articles`, `get_recent_curations`, `call_llm`, `store_digest` |
+
+**Agent-to-agent pipeline:**
+```
+Crawler Agent → [ArticleCrawled] → Curator Agent → [ArticleCurated] → Synthesizer Agent
+```
 
 ### 2. Memory (The Knowledge)
 
-| Layer | Purpose | Tech |
-|-------|---------|------|
-| **Short-term** | Current session context, what you just asked about | In-memory / Redis |
-| **Long-term** | Every article, summary, embedding, and topic tag | ChromaDB (vector store) |
-| **Structured** | Article metadata, source configs, user preferences | SQLite → PostgreSQL |
-| **Narrative tracking** | Links related articles into storylines that evolve over time | Embedding cosine similarity against storyline centroids; `storylines` + `storyline_articles` tables |
+Each memory layer is a **distinct subsystem with its own API** — not just a database table, but an abstraction you interact with through a clean interface.
 
-### 3. MCP Server (The Interface)
+| Layer | Purpose | Tech | API Surface |
+|-------|---------|------|-------------|
+| **Short-term** | Current session context, conversation state | In-memory / Redis | `store(key, value, ttl)`, `recall(key)`, `forget(key)` |
+| **Long-term** | Article embeddings, semantic search index | ChromaDB (vector store) | `embed(content)`, `search(query, k)`, `similar(embedding, threshold)` |
+| **Structured** | Article metadata, source configs, relationships | SQLite → PostgreSQL | Standard CRUD via SQLAlchemy models |
+| **Narrative** | Storyline clusters that evolve over time | Embeddings + clustering | `assign_to_storyline(article)`, `merge_storylines()`, `get_timeline(storyline_id)` |
 
-Build a custom MCP server from scratch that exposes your knowledge base as tools:
+**Memory Inspector UI** — a debug page that lets you see what each memory layer contains: browse stored embeddings, view storyline clusters, inspect session state, and query each layer directly. This makes the learning tangible — you can *see* what the agents remember.
 
-| Tool | Description |
-|------|-------------|
-| `search_articles` | Semantic search across your entire corpus |
-| `get_digest` | Daily/weekly summary of top developments |
-| `trending_topics` | What's hot in AI right now based on volume + velocity |
-| `compare_announcements` | Side-by-side analysis of announcements from different companies |
-| `get_narrative` | Track how a storyline has evolved over time |
-| `ask_question` | Free-form Q&A grounded in your article corpus |
+### 3. Skills & MCP (The Interface)
+
+Each capability is a **composable skill** — a self-contained unit that can be invoked standalone or chained with other skills. Skills are exposed as MCP tools so they're usable from Claude Desktop, Claude Code, or any MCP client.
+
+| Skill | Description | Can Chain With |
+|-------|-------------|----------------|
+| `search_articles` | Semantic search across your entire corpus | `compare`, `summarize` |
+| `get_digest` | Daily/weekly summary of top developments | `search_articles` |
+| `trending_topics` | What's hot based on volume + velocity | `search_articles`, `get_narrative` |
+| `compare` | Side-by-side analysis of announcements | `search_articles` |
+| `get_narrative` | Track how a storyline has evolved | `summarize` |
+| `ask_question` | Free-form Q&A grounded in articles | all skills |
+
+**Skill chaining example:** "Compare Anthropic's and Google's agent approaches" →
+1. `search_articles("Anthropic agents")` → top 5 results
+2. `search_articles("Google agents")` → top 5 results
+3. `compare(results_a, results_b)` → structured comparison
 
 Connectable to Claude Desktop, Claude Code, or any MCP client.
 
@@ -138,19 +160,25 @@ Tables are introduced incrementally across phases.
 
 ## Build Phases
 
-### Phase 1 — The Foundation (Week 1–2)
+### Phase 1 — Agent Framework + Basic Crawling (Week 1–2)
 
-**Goal:** A working feed that crawls 5 blogs, shows articles in a web UI, and sends daily digest emails to subscribers.
+**Goal:** Build the agent framework, implement the Crawler Agent as the first agent, crawl 5 blogs, show articles in a web UI, and send daily digest emails.
 
 **Target sources:** Anthropic Blog, Google AI Blog, OpenAI Blog, Meta AI Blog, HuggingFace Blog (see Sources — Phase 1 above).
+
+**Agent framework (build this first):**
+- `BaseAgent` class with lifecycle: `perceive()` → `reason()` → `act()` → `reflect()`
+- Tool registry — `@agent_tool` decorator to register callable tools with typed inputs/outputs
+- Agent configuration — each agent declares its name, role description, and available tools
+- Decision logging — every agent step is logged as structured JSON via `structlog`
+- **Crawler Agent** — first concrete agent. Implements `perceive` (check sources for new content), `reason` (should I crawl this source now?), `act` (fetch + normalize + store), `reflect` (log results, update source status)
 
 **Backend:**
 - FastAPI app structure with proper project layout
 - Source registry — config-driven list of sources with URL, type (RSS/HTML), schedule
-- Crawler module — async fetcher using `httpx` + `trafilatura` for clean text extraction
 - SQLite database — full schema defined in Data Model section above
 - REST endpoints: `GET /articles`, `GET /articles/{id}`, `POST /crawl` (manual trigger)
-- APScheduler — crawl every 30 minutes
+- APScheduler — triggers Crawler Agent every 30 minutes
 - Structured logging with `structlog` — JSON output with correlation IDs, stdout + rotating file
 
 **Crawler resilience:**
@@ -189,7 +217,7 @@ Tables are introduced incrementally across phases.
 - Basic text search
 - Subscribe-to-digest form (email input + submit) with confirmation message
 
-**Key learning:** async Python, web scraping, API design, email delivery, retry/resilience patterns.
+**Key learning:** Agent architecture (perceive/reason/act/reflect), tool registration pattern, async Python, web scraping, resilience patterns.
 
 ```
 ai-pulse/
@@ -206,9 +234,24 @@ ai-pulse/
 │   │   ├── rss_crawler.py    # RSS feed crawler
 │   │   └── html_crawler.py   # HTML scraping crawler
 │   ├── agents/
-│   │   ├── base.py           # Abstract agent interface
-│   │   ├── curator.py        # Curator agent (Phase 2)
-│   │   └── synthesizer.py    # Synthesizer agent (Phase 2)
+│   │   ├── base.py           # BaseAgent framework + lifecycle hooks
+│   │   ├── tools.py          # @agent_tool decorator + tool registry
+│   │   ├── messages.py       # Typed messages + message bus
+│   │   ├── crawler.py        # Crawler Agent (Phase 1)
+│   │   ├── curator.py        # Curator Agent (Phase 2)
+│   │   └── synthesizer.py    # Synthesizer Agent (Phase 2)
+│   ├── memory/
+│   │   ├── base.py           # MemoryLayer abstract interface
+│   │   ├── structured.py     # StructuredMemory (SQLite/Postgres)
+│   │   ├── long_term.py      # LongTermMemory (ChromaDB) — Phase 3
+│   │   ├── short_term.py     # ShortTermMemory (in-memory/Redis) — Phase 3
+│   │   └── narrative.py      # NarrativeMemory (clustering) — Phase 3
+│   ├── skills/
+│   │   ├── base.py           # BaseSkill + @skill decorator — Phase 4
+│   │   ├── registry.py       # Skill registry — Phase 4
+│   │   ├── search.py         # search_articles skill
+│   │   ├── compare.py        # compare skill
+│   │   └── qa.py             # ask_question skill
 │   ├── routers/
 │   │   ├── articles.py       # Article CRUD endpoints
 │   │   ├── sources.py        # Source management endpoints
@@ -231,66 +274,82 @@ ai-pulse/
 
 ---
 
-### Phase 2 — The Agent Brain (Week 3–4)
+### Phase 2 — Multi-Agent Pipeline + Memory Layers (Week 3–4)
 
-**Goal:** Articles are now AI-curated, scored, tagged, and summarized.
+**Goal:** Build the multi-agent pipeline (Crawler → Curator → Synthesizer), implement the memory subsystem with explicit APIs per layer, and add agent tools.
 
-**New components:**
-- **Curator Agent** — for each new article:
-  - Calls Claude API to score relevance (1–10)
-  - Extracts 3–5 key claims / takeaways
-  - Assigns topic tags (e.g., "agents", "open-source", "reasoning", "safety")
-  - Detects if it's a major announcement vs. incremental update
-- **Agent framework** — build a simple agent loop:
-  ```
-  while has_unprocessed_articles:
-      article = get_next_unprocessed()
-      result = curator_agent.process(article)
-      store(result)
-  ```
+**Multi-agent pipeline:**
+- **Message bus** — implement typed message passing between agents:
+  - Crawler Agent emits `ArticleCrawled(article_id, source_id, url)`
+  - Curator Agent listens for `ArticleCrawled`, emits `ArticleCurated(article_id, score, topics, claims)`
+  - Synthesizer Agent listens for `ArticleCurated`, generates digests when triggered
+- **Curator Agent** — second agent using the BaseAgent framework from Phase 1:
+  - `perceive`: receive `ArticleCrawled` messages
+  - `reason`: call LLM to score relevance, extract claims, assign topics
+  - `act`: store curation results, emit `ArticleCurated`
+  - `reflect`: log decision rationale, track accuracy over time
+  - **Agent tools**: `search_related(query)` — find similar articles already in DB; `check_duplicate_topic(claims)` — detect if this covers the same ground as a recent article; `call_llm(prompt, model)` — invoke Claude API with cost tracking
+- **Synthesizer Agent** — third agent:
+  - `perceive`: collect today's curated articles
+  - `reason`: group by theme, rank by importance
+  - `act`: generate coherent digest via LLM, store result
+  - `reflect`: log token usage and quality metrics
 - **Daily Digest endpoint** — `GET /digest?date=2026-04-09`
-  - Synthesizer agent takes today's top articles and writes a coherent summary
-  - Grouped by theme, ranked by importance
+
+**Memory subsystem:**
+- **Structured memory** (SQLite) — `StructuredMemory` class wrapping SQLAlchemy with a clean API. This is the first memory layer, active since Phase 1 but now formalized.
+- **Memory interface** — abstract `MemoryLayer` base class defining `store()`, `recall()`, `search()`, `forget()`. Each layer implements this interface.
+- **Memory inspector UI** — debug page to browse each memory layer: view stored articles, see curation decisions, query the structured store directly. Makes learning tangible.
 
 **LLM cost management:**
 - **Tiered processing pipeline:**
-  1. **Haiku triage** — every new article gets a fast Haiku pass: binary relevance check (relevant to AI? yes/no) + preliminary score (1-10). Cost: ~$0.001/article.
-  2. **Sonnet deep curation** — only articles scoring >= 5 in triage get full Sonnet processing: detailed claims extraction, nuanced topic tagging, announcement classification. Cost: ~$0.01/article.
+  1. **Haiku triage** — every new article gets a fast Haiku pass: binary relevance + preliminary score (1-10). Cost: ~$0.001/article.
+  2. **Sonnet deep curation** — only articles scoring >= 5 get full Sonnet processing: claims extraction, topic tagging, announcement classification. Cost: ~$0.01/article.
   3. Expected filtering: ~40% of articles filtered at triage, reducing Sonnet calls by nearly half.
-- Track token usage and cost per article in `curation_results` table (prompt_tokens, completion_tokens, cost_usd).
-- Daily cost cap — configurable maximum daily LLM spend. When reached, queue remaining articles for next day.
+- Track token usage and cost per article in `curation_results` table.
+- Daily cost cap — configurable max daily LLM spend. When reached, queue remaining articles for next day.
 
 **Observability:**
-- **Crawler health endpoint** — `GET /health/crawlers` surfacing `crawl_logs` data: success rate per source, articles/crawl, error frequency, last successful crawl.
-- **Agent decision logging** — every curator decision stored in `curation_results` with full traceability: input article ID, model used, score, topics, latency, token count.
-- **Curation review UI** — admin page showing recent curation decisions side-by-side with the article. Allows manual override of scores/tags, feeding back into prompt tuning.
-- **Cost dashboard** — `GET /stats/costs` with daily/weekly LLM spend broken down by model and agent type.
+- **Crawler health endpoint** — `GET /health/crawlers` surfacing `crawl_logs` data.
+- **Agent decision logging** — every agent decision stored with full traceability: input, model, output, latency, token count.
+- **Curation review UI** — admin page showing curation decisions side-by-side with articles. Manual override feeds back into prompt tuning.
+- **Cost dashboard** — `GET /stats/costs` with daily/weekly spend by model and agent.
 
 **Minimal MCP server (early preview):**
 - Two read-only tools for dogfooding: `search_articles` (text search) + `get_digest` (latest digest)
 - Ships as `mcp_server.py` using Python `mcp` SDK, connectable to Claude Desktop immediately
-- Purpose: validate the MCP developer experience early, before investing in the full tool suite
 
 **Frontend additions:**
 - Importance score badges on articles
 - Topic tag filters
 - Daily digest page
+- Memory inspector page (admin)
 - Crawler health + cost dashboards (admin)
 
-**Key learning:** LLM tool calling, agent loops, structured output parsing, prompt engineering for curation, cost optimization.
+**Key learning:** Multi-agent coordination, message passing, agent tools, memory abstraction layers, LLM tool calling, prompt engineering, cost optimization.
 
 ---
 
-### Phase 3 — Memory & Intelligence (Week 5–6)
+### Phase 3 — Vector Memory + Intelligence (Week 5–6)
 
-**Goal:** Semantic search, narrative tracking, and conversational Q&A.
+**Goal:** Activate the long-term and narrative memory layers. All 4 memory layers now operational.
 
-**New components:**
-- **ChromaDB integration:**
-  - Embed every article using Voyage / sentence-transformers
-  - Store embeddings with metadata (source, date, topics, score)
-- **Semantic search:** `GET /search?q=how is MCP adoption going`
-  - Vector similarity search across entire corpus
+**Long-term memory (ChromaDB):**
+- Implement `LongTermMemory` class (extends `MemoryLayer` interface from Phase 2)
+- `embed(content)` — generate embeddings using Voyage / sentence-transformers
+- `search(query, k)` — vector similarity search across corpus
+- `similar(embedding, threshold)` — find articles above similarity threshold
+- Embed every article on ingest; store with metadata (source, date, topics, score)
+
+**Short-term memory (session context):**
+- Implement `ShortTermMemory` class (extends `MemoryLayer`)
+- `store(key, value, ttl)` — store with time-to-live
+- `recall(key)` — retrieve if not expired
+- `forget(key)` — explicit removal
+- Used by the conversational Q&A to track what the user just asked about
+
+**Semantic search:** `GET /search?q=how is MCP adoption going`
+  - Vector similarity search via `LongTermMemory.search()`
   - Re-rank results with an LLM for relevance
 - **Narrative tracking algorithm:**
   - **Storyline detection:** When a new article is embedded, compute cosine similarity against all active storyline centroids. If max similarity > 0.78, assign to that storyline. If no match, create a new storyline seeded by this article.
@@ -304,43 +363,63 @@ ai-pulse/
   - RAG pipeline: embed question → retrieve relevant articles → LLM generates grounded answer with citations
   - Session memory — remembers context within a conversation
 
+**Memory inspector upgrades:**
+- Browse ChromaDB embeddings — see nearest neighbors for any article
+- Visualize storyline clusters — which articles are grouped together and why
+- View session memory — what the Q&A agent remembers about the current conversation
+- All 4 memory layers now visible and queryable through the inspector
+
 **Frontend additions:**
 - Semantic search bar (replaces text search)
 - Narrative/storyline pages with timelines
 - Chat interface for Q&A
 
-**Key learning:** embeddings, vector databases, RAG, retrieval strategies, conversation memory management.
+**Key learning:** Embeddings, vector databases, 4-layer memory architecture, RAG, retrieval strategies, session memory management.
 
 ---
 
-### Phase 4 — MCP Server (Week 7–8)
+### Phase 4 — Composable Skills + Full MCP (Week 7–8)
 
-**Goal:** Expand the minimal MCP server (shipped in Phase 2) into the full tool suite, with semantic search, narrative tools, and Q&A.
+**Goal:** Refactor capabilities into composable, chainable skills. Expand the Phase 2 MCP server into the full tool suite.
 
-**New components:**
-- **Full MCP server** — the Phase 2 server only exposed `search_articles` (text) and `get_digest`. Phase 4 upgrades `search_articles` to semantic search and adds the remaining tools, all powered by the ChromaDB + RAG infrastructure built in Phase 3:
-- **MCP server** using the Python `mcp` SDK:
-  ```python
-  @server.tool("search_articles")
-  async def search_articles(query: str, limit: int = 5):
-      """Search AI news articles semantically."""
-      results = await vector_store.search(query, limit)
-      return format_results(results)
+**Skill framework (you build this):**
+- `BaseSkill` class — each skill is a self-contained capability with typed input/output
+- `@skill` decorator — register a function as a skill with name, description, input/output schemas
+- **Skill chaining** — skills can call other skills. A `compare` skill calls `search_articles` twice then synthesizes. An `ask_question` skill orchestrates search → filter → generate.
+- **Skill registry** — central registry that the MCP server reads from. Add a skill once, it's automatically available as an MCP tool.
 
-  @server.tool("get_digest")
-  async def get_digest(date: str = "today"):
-      """Get AI news digest for a given date."""
-      return await synthesizer.generate_digest(date)
+**Concrete skills:**
+```python
+@skill("search_articles")
+async def search_articles(query: str, limit: int = 5) -> list[Article]:
+    """Semantic search across your entire corpus."""
+    return await long_term_memory.search(query, limit)
 
-  @server.tool("trending_topics")
-  async def trending_topics(days: int = 7):
-      """What's trending in AI over the past N days."""
-      return await analytics.get_trending(days)
-  ```
-- **Claude Desktop integration** — add your MCP server to `claude_desktop_config.json`
+@skill("compare")
+async def compare(topic_a: str, topic_b: str) -> Comparison:
+    """Side-by-side analysis of two topics."""
+    results_a = await search_articles(topic_a)
+    results_b = await search_articles(topic_b)
+    return await synthesizer.compare(results_a, results_b)
+
+@skill("ask_question")
+async def ask_question(question: str, session_id: str) -> Answer:
+    """Free-form Q&A — chains search, retrieval, and generation."""
+    context = await short_term_memory.recall(session_id)
+    articles = await search_articles(question)
+    answer = await synthesizer.answer(question, articles, context)
+    await short_term_memory.store(session_id, answer, ttl=3600)
+    return answer
+```
+
+**Full MCP server:**
+- Expand Phase 2 minimal server — every registered skill is automatically exposed as an MCP tool
+- `search_articles` upgraded from text to semantic search
+- Add `trending_topics`, `compare`, `get_narrative`, `ask_question`
+- **Claude Desktop integration** — add to `claude_desktop_config.json`
 - **Claude Code integration** — use your news corpus while coding
 
-**Key learning:** MCP protocol internals, tool design, server lifecycle, client-server communication.
+**Key learning:** Composable skill architecture, skill chaining, MCP protocol internals, tool design, server lifecycle.
 
 ---
 
@@ -385,7 +464,7 @@ pip install fastapi uvicorn httpx trafilatura beautifulsoup4 \
     sqlalchemy aiosqlite apscheduler anthropic chromadb mcp pydantic
 
 # Create project structure
-mkdir -p backend/{crawlers,routers,agents} frontend/src/components
+mkdir -p backend/{crawlers,routers,agents,memory,skills,email/templates} frontend/src/components
 
 # Start building Phase 1
 touch backend/main.py backend/config.py backend/models.py backend/database.py
@@ -397,16 +476,21 @@ touch backend/main.py backend/config.py backend/models.py backend/database.py
 
 | Concept | Where You'll Learn It |
 |---------|----------------------|
-| Agent architecture (perceive → reason → act) | Phase 2 — Curator & Synthesizer agents |
-| LLM tool calling | Phase 2 — structured extraction, Phase 4 — MCP tools |
-| Short-term memory | Phase 3 — conversation context in Q&A |
-| Long-term memory (vector store) | Phase 3 — ChromaDB embeddings + semantic search |
-| RAG (Retrieval Augmented Generation) | Phase 3 — Q&A grounded in articles |
-| MCP protocol | Phase 4 — building a server from scratch |
-| Multi-agent coordination | Phase 2+ — crawler → curator → synthesizer pipeline |
-| Prompt engineering | Throughout — curation prompts, digest generation, Q&A |
-| Async Python patterns | Phase 1 — concurrent crawling with httpx |
+| **Agent framework design** | Phase 1 — BaseAgent, lifecycle hooks, tool registry |
+| **Agent architecture (perceive → reason → act → reflect)** | Phase 1 — Crawler Agent as first concrete implementation |
+| **Multi-agent coordination** | Phase 2 — message bus, Crawler → Curator → Synthesizer pipeline |
+| **Agent tools** | Phase 2 — agents calling tools (search, LLM, store) with typed I/O |
+| **Memory layer abstraction** | Phase 2 — MemoryLayer interface, StructuredMemory implementation |
+| **Long-term memory (vector store)** | Phase 3 — ChromaDB, embeddings, LongTermMemory class |
+| **Short-term memory (session)** | Phase 3 — ShortTermMemory with TTL, conversation context |
+| **Narrative memory (graph/clustering)** | Phase 3 — storyline detection, centroid matching, merging |
+| **RAG (Retrieval Augmented Generation)** | Phase 3 — Q&A grounded in articles via memory layers |
+| **Composable skills** | Phase 4 — BaseSkill, skill chaining, skill registry |
+| **MCP protocol** | Phase 2 (minimal) → Phase 4 (full) — skills exposed as MCP tools |
+| **LLM tool calling** | Phase 2 — structured extraction, cost-tiered processing |
+| **Prompt engineering** | Throughout — curation prompts, digest generation, Q&A |
+| **Async Python patterns** | Phase 1 — concurrent crawling with httpx |
 
 ---
 
-*Start with Phase 1. Ship something that works. Then layer intelligence on top.*
+*Start with Phase 1. Build the agent framework first, then the crawler. Every phase adds a new learning pillar: agents → memory → skills.*

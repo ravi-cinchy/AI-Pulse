@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AI Pulse is an AI-powered news aggregation and conversation platform that crawls, curates, and synthesizes AI news. It provides a conversational interface and an MCP server for querying the knowledge base from Claude Desktop/Code.
+AI Pulse is a **learning project** for building AI agents, memory systems, and composable skills. The domain is AI news aggregation — crawl, curate, and synthesize AI news — but the focus is on the architecture patterns: agent frameworks, multi-agent coordination, layered memory, and MCP-based skill composition.
 
 ## Tech Stack
 
@@ -19,13 +19,11 @@ AI Pulse is an AI-powered news aggregation and conversation platform that crawls
 - **Logging:** structlog (structured JSON)
 - **Email:** Resend (daily digest delivery)
 
-## Architecture
+## Architecture — Three Learning Pillars
 
-Three core subsystems:
-
-1. **Agents** — Crawler (fetches content), Curator (scores/tags via Claude API), Synthesizer (generates digests, answers questions). Each follows a perceive-reason-act-reflect loop.
-2. **Memory** — Short-term (in-memory/Redis), long-term (ChromaDB vectors), structured (SQLite/Postgres), narrative tracking (graph relationships + embeddings).
-3. **MCP Server** — Exposes tools: `search_articles`, `get_digest`, `trending_topics`, `compare_announcements`, `get_narrative`, `ask_question`.
+1. **Agents** — Reusable `BaseAgent` framework with perceive/reason/act/reflect lifecycle, `@agent_tool` decorator for tool registration, typed message bus for agent-to-agent communication. Three concrete agents: Crawler, Curator, Synthesizer.
+2. **Memory** — 4 layers, each implementing a `MemoryLayer` interface: Structured (SQLite), Long-term (ChromaDB vectors), Short-term (in-memory/Redis with TTL), Narrative (embedding clustering). Memory inspector UI for debugging.
+3. **Skills & MCP** — Composable `BaseSkill` framework with `@skill` decorator and skill registry. Skills can chain other skills. All skills auto-exposed as MCP tools via the Python `mcp` SDK.
 
 ## Project Structure (Target)
 
@@ -43,7 +41,9 @@ ai-pulse/
 │   │   ├── base.py           # Abstract crawler interface
 │   │   ├── rss_crawler.py
 │   │   └── html_crawler.py
-│   ├── agents/               # Curator, Synthesizer agents (Phase 2+)
+│   ├── agents/               # BaseAgent framework, tool registry, message bus, concrete agents
+│   ├── memory/               # MemoryLayer interface + 4 layer implementations
+│   ├── skills/               # BaseSkill framework, skill registry, composable skills (Phase 4)
 │   ├── routers/
 │   │   ├── articles.py       # Article CRUD endpoints
 │   │   ├── sources.py        # Source management endpoints
@@ -103,13 +103,13 @@ npm test
 
 The project is built incrementally. See `docs/requirements.md` for full details.
 
-| Phase | Focus | Key Deliverable |
-|-------|-------|-----------------|
-| 1 | Foundation | Crawl 5 blogs, feed UI, daily digest emails via Resend |
-| 2 | Agent Brain | Curator agent (Haiku triage + Sonnet curation), minimal MCP server, observability |
-| 3 | Memory | ChromaDB, semantic search, RAG Q&A, narrative tracking |
-| 4 | Full MCP | Expand MCP server with semantic search, trending, narratives, Q&A tools |
-| 5 | Scale Sources | ArXiv, Reddit, Twitter/X, HN, YouTube, GitHub |
+| Phase | Focus | Key Learning |
+|-------|-------|--------------|
+| 1 | Agent Framework + Crawling | BaseAgent, tool registry, perceive/reason/act/reflect lifecycle |
+| 2 | Multi-Agent Pipeline + Memory | Message bus, agent tools, MemoryLayer interface, memory inspector |
+| 3 | Vector Memory + Intelligence | 4-layer memory (structured/long-term/short-term/narrative), RAG, embeddings |
+| 4 | Composable Skills + MCP | BaseSkill, skill chaining, skill registry, full MCP server |
+| 5 | Scale Sources | New crawler plugins (ArXiv, Reddit, Twitter/X, HN, YouTube, GitHub) |
 
 ## Phase 1 Data Sources
 
@@ -121,6 +121,10 @@ The project is built incrementally. See `docs/requirements.md` for full details.
 
 ## Design Decisions
 
+- **Agent framework first:** Build `BaseAgent` with lifecycle hooks before implementing any concrete agent. Crawler Agent is the first test of the framework.
+- **Message bus for agent coordination:** Agents communicate via typed messages (`ArticleCrawled`, `ArticleCurated`), not direct function calls. Keeps agents decoupled.
+- **Memory as an abstraction:** Each memory layer implements a `MemoryLayer` interface (`store`, `recall`, `search`, `forget`). Concrete implementations are swappable.
+- **Skills are composable:** Each skill can call other skills. The MCP server reads from the skill registry — add a skill once, it's automatically an MCP tool.
 - **Crawler plugin architecture:** All crawlers inherit from an abstract base class in `crawlers/base.py`. New sources are added as plugins.
 - **Config-driven sources:** Source list with URL, type (RSS/HTML), and schedule lives in `config.py`, not hardcoded in crawlers.
 - **SQLite first:** Start with SQLite via aiosqlite for simplicity; schema should be migration-ready for PostgreSQL.
@@ -128,6 +132,5 @@ The project is built incrementally. See `docs/requirements.md` for full details.
 - **Content normalization:** RawArticle -> CleanArticle canonical schema via trafilatura. All downstream components consume the same clean format.
 - **Deduplication:** URL normalization + SHA-256 content hash (Phase 1), embedding similarity gate in Phase 2.
 - **LLM cost tiering:** Haiku for cheap triage, Sonnet only for articles scoring >= 5. Daily cost cap with queuing.
-- **Agent loop pattern:** Agents process items sequentially — fetch unprocessed, run through LLM, store result. Keep this loop simple and observable.
-- **Early MCP dogfooding:** Minimal MCP server ships in Phase 2 (text search + digest), full suite in Phase 4.
+- **Early MCP dogfooding:** Minimal MCP server ships in Phase 2 (text search + digest), full skill suite in Phase 4.
 - **RAG pipeline (Phase 3):** Embed question -> vector similarity search -> re-rank with LLM -> generate grounded answer with citations.
