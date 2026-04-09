@@ -23,7 +23,7 @@ An AI-powered platform that crawls, curates, and synthesizes AI news from across
 
 | Agent | Role |
 |-------|------|
-| **Crawler Agent** | Fetches content from sources on a schedule, extracts clean text from HTML/RSS |
+| **Crawler Agent** | Fetches content from sources on a schedule, extracts clean text from HTML/RSS, normalizes to canonical schema (title, author, published_at, plain-text body, URL, content hash) |
 | **Curator Agent** | Reads raw content, scores relevance (1-10), extracts key claims, tags topics |
 | **Synthesizer Agent** | Generates daily/weekly digests, answers questions by pulling from memory |
 
@@ -36,7 +36,7 @@ Each agent is an autonomous unit with a defined role, tools it can call, and a d
 | **Short-term** | Current session context, what you just asked about | In-memory / Redis |
 | **Long-term** | Every article, summary, embedding, and topic tag | ChromaDB (vector store) |
 | **Structured** | Article metadata, source configs, user preferences | SQLite → PostgreSQL |
-| **Narrative tracking** | Links related articles into storylines that evolve over time | Graph relationships in DB + embeddings |
+| **Narrative tracking** | Links related articles into storylines that evolve over time | Embedding cosine similarity against storyline centroids; `storylines` + `storyline_articles` tables |
 
 ### 3. MCP Server (The Interface)
 
@@ -96,6 +96,43 @@ Connectable to Claude Desktop, Claude Code, or any MCP client.
 | **MCP** | Python MCP SDK (`mcp`) | Official SDK, well-documented |
 | **Scraping** | httpx + BeautifulSoup / trafilatura | Async HTTP + clean text extraction |
 | **Embeddings** | Anthropic Voyage / sentence-transformers | For semantic search in ChromaDB |
+| **Logging** | structlog | Structured JSON logging for crawlers and agents |
+| **Email** | Resend | Transactional email delivery for daily digests (free tier: 100/day) |
+
+---
+
+## Data Model
+
+Tables are introduced incrementally across phases.
+
+### Phase 1
+
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| `sources` | id, name, url, source_type (RSS/HTML), crawl_interval_minutes, is_active, last_crawled_at, created_at | Config-driven source registry |
+| `articles` | id, source_id (FK), url, url_normalized, title, author, content_clean, content_raw, content_hash (SHA-256), published_at, crawled_at | Deduplicated article storage |
+| `crawl_logs` | id, source_id (FK), started_at, finished_at, status (success/partial/failed), articles_found, articles_new, error_message | Crawler health tracking |
+| `subscribers` | id, email, is_active, subscribed_at, unsubscribed_at | Email digest subscribers |
+| `digest_sends` | id, subscriber_id (FK), digest_date, sent_at, status | Tracks which digests were sent to whom |
+
+### Phase 2
+
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| `curation_results` | id, article_id (FK), relevance_score (1-10), is_major_announcement, model_used, prompt_tokens, completion_tokens, cost_usd, curated_at | Agent curation output + cost tracking |
+| `article_claims` | id, curation_result_id (FK), claim_text, ordering | Key claims extracted per article |
+| `topics` | id, name, slug, description | Canonical topic taxonomy |
+| `article_topics` | article_id (FK), topic_id (FK), confidence | Many-to-many article-topic assignment |
+| `digests` | id, digest_date, digest_type (daily/weekly), content_markdown, model_used, created_at | Generated AI digest storage |
+
+### Phase 3
+
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| `storylines` | id, title, summary, centroid_embedding_id, first_seen_at, last_updated_at, is_active, article_count | Narrative storyline cluster |
+| `storyline_articles` | storyline_id (FK), article_id (FK), similarity_score, added_at | Articles assigned to storylines |
+| `conversations` | id, started_at, last_message_at | Q&A session tracking |
+| `conversation_messages` | id, conversation_id (FK), role (user/assistant), content, sources_cited (JSON), created_at | Chat history for session memory |
 
 ---
 
@@ -103,39 +140,82 @@ Connectable to Claude Desktop, Claude Code, or any MCP client.
 
 ### Phase 1 — The Foundation (Week 1–2)
 
-**Goal:** A working feed that crawls 5 blogs and shows articles in a web UI.
+**Goal:** A working feed that crawls 5 blogs, shows articles in a web UI, and sends daily digest emails to subscribers.
+
+**Target sources:** Anthropic Blog, Google AI Blog, OpenAI Blog, Meta AI Blog, HuggingFace Blog (see Sources — Phase 1 above).
 
 **Backend:**
 - FastAPI app structure with proper project layout
 - Source registry — config-driven list of sources with URL, type (RSS/HTML), schedule
 - Crawler module — async fetcher using `httpx` + `trafilatura` for clean text extraction
-- SQLite database — articles table (id, source, title, url, content, published_at, created_at)
+- SQLite database — full schema defined in Data Model section above
 - REST endpoints: `GET /articles`, `GET /articles/{id}`, `POST /crawl` (manual trigger)
 - APScheduler — crawl every 30 minutes
+- Structured logging with `structlog` — JSON output with correlation IDs, stdout + rotating file
+
+**Crawler resilience:**
+- **30-second per-request timeout**, configurable per source
+- **3 retries with exponential backoff**: 2s / 8s / 32s delays for transient HTTP errors (429, 500, 502, 503)
+- **5-minute hard cap per full crawl run** — if the overall crawl exceeds this, abort remaining sources and log partial results
+- **Per-source rate limiting** via `asyncio.Semaphore` (default 1 req/s per domain)
+- **Partial failure isolation** — one source failing doesn't block others; each source crawls independently
+- **3 consecutive failures** for a source → mark `is_active = false`, surface in UI
+- **No CAPTCHA handling** — if a source starts requiring CAPTCHAs, treat as dead and investigate
+
+**Content normalization:**
+- Every crawler produces a `RawArticle` → transformed to `CleanArticle` (canonical schema) before storage
+- `CleanArticle` schema: title, author (nullable), published_at (fallback to crawl time), content_clean (plain text via trafilatura), content_raw (original HTML), url, url_normalized, content_hash, source_id
+- trafilatura handles boilerplate removal; post-processing: strip excess whitespace, normalize Unicode, truncate to 50K chars
+- Date parsing: `dateutil.parser` with fallback to crawl timestamp
+
+**Deduplication:**
+- URL normalization at crawl time — strip query params, fragments, trailing slashes, normalize to https. Store both raw `url` and `url_normalized`
+- SHA-256 hash of `content_clean` with unique DB constraint — rejects exact duplicates at insert
+- Title embedding similarity gate (>0.92 against last 7 days) added in Phase 2 when embeddings arrive
+
+**Email subscriptions:**
+- `POST /subscribe` — accepts email address, stores in `subscribers` table
+- `POST /unsubscribe` — removes subscriber (or via unsubscribe link in email)
+- `GET /subscribers` — admin-only list
+- **Resend** integration for email delivery (free tier: 100 emails/day)
+- **Daily digest job** — APScheduler task runs at a configured time (e.g., 8:00 AM), collects articles from the past 24 hours, renders an HTML email template, sends to all active subscribers via Resend API
+- Email template: grouped by source, article title + snippet + link, date
 
 **Frontend:**
 - React app with Vite
-- Simple feed view — list of articles sorted by date
+- Article feed sorted by date with title, source badge, published date, and text snippet
 - Article detail view — full extracted content
 - Filter by source
-- Basic search (text match for now)
+- Basic text search
+- Subscribe-to-digest form (email input + submit) with confirmation message
 
-**Key learning:** async Python, web scraping, basic API design.
+**Key learning:** async Python, web scraping, API design, email delivery, retry/resilience patterns.
 
 ```
 ai-pulse/
 ├── backend/
 │   ├── main.py              # FastAPI app + scheduler
+│   ├── mcp_server.py         # MCP server entry point (ships Phase 2)
 │   ├── config.py             # Source registry, settings
 │   ├── models.py             # SQLAlchemy/Pydantic models
 │   ├── database.py           # DB connection + migrations
+│   ├── normalization.py      # Content cleaning + canonical schema
+│   ├── dedup.py              # URL normalization + content hash dedup
 │   ├── crawlers/
 │   │   ├── base.py           # Abstract crawler interface
 │   │   ├── rss_crawler.py    # RSS feed crawler
 │   │   └── html_crawler.py   # HTML scraping crawler
+│   ├── agents/
+│   │   ├── base.py           # Abstract agent interface
+│   │   ├── curator.py        # Curator agent (Phase 2)
+│   │   └── synthesizer.py    # Synthesizer agent (Phase 2)
 │   ├── routers/
 │   │   ├── articles.py       # Article CRUD endpoints
-│   │   └── sources.py        # Source management endpoints
+│   │   ├── sources.py        # Source management endpoints
+│   │   └── subscriptions.py  # Email subscription endpoints
+│   ├── email/
+│   │   ├── sender.py         # Resend integration + digest sender
+│   │   └── templates/        # HTML email templates
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
@@ -172,12 +252,32 @@ ai-pulse/
   - Synthesizer agent takes today's top articles and writes a coherent summary
   - Grouped by theme, ranked by importance
 
+**LLM cost management:**
+- **Tiered processing pipeline:**
+  1. **Haiku triage** — every new article gets a fast Haiku pass: binary relevance check (relevant to AI? yes/no) + preliminary score (1-10). Cost: ~$0.001/article.
+  2. **Sonnet deep curation** — only articles scoring >= 5 in triage get full Sonnet processing: detailed claims extraction, nuanced topic tagging, announcement classification. Cost: ~$0.01/article.
+  3. Expected filtering: ~40% of articles filtered at triage, reducing Sonnet calls by nearly half.
+- Track token usage and cost per article in `curation_results` table (prompt_tokens, completion_tokens, cost_usd).
+- Daily cost cap — configurable maximum daily LLM spend. When reached, queue remaining articles for next day.
+
+**Observability:**
+- **Crawler health endpoint** — `GET /health/crawlers` surfacing `crawl_logs` data: success rate per source, articles/crawl, error frequency, last successful crawl.
+- **Agent decision logging** — every curator decision stored in `curation_results` with full traceability: input article ID, model used, score, topics, latency, token count.
+- **Curation review UI** — admin page showing recent curation decisions side-by-side with the article. Allows manual override of scores/tags, feeding back into prompt tuning.
+- **Cost dashboard** — `GET /stats/costs` with daily/weekly LLM spend broken down by model and agent type.
+
+**Minimal MCP server (early preview):**
+- Two read-only tools for dogfooding: `search_articles` (text search) + `get_digest` (latest digest)
+- Ships as `mcp_server.py` using Python `mcp` SDK, connectable to Claude Desktop immediately
+- Purpose: validate the MCP developer experience early, before investing in the full tool suite
+
 **Frontend additions:**
 - Importance score badges on articles
 - Topic tag filters
 - Daily digest page
+- Crawler health + cost dashboards (admin)
 
-**Key learning:** LLM tool calling, agent loops, structured output parsing, prompt engineering for curation.
+**Key learning:** LLM tool calling, agent loops, structured output parsing, prompt engineering for curation, cost optimization.
 
 ---
 
@@ -192,9 +292,13 @@ ai-pulse/
 - **Semantic search:** `GET /search?q=how is MCP adoption going`
   - Vector similarity search across entire corpus
   - Re-rank results with an LLM for relevance
-- **Narrative tracking:**
-  - Group related articles into "storylines" (e.g., "Claude MCP ecosystem")
-  - Track how sentiment, claims, and key players evolve
+- **Narrative tracking algorithm:**
+  - **Storyline detection:** When a new article is embedded, compute cosine similarity against all active storyline centroids. If max similarity > 0.78, assign to that storyline. If no match, create a new storyline seeded by this article.
+  - **Centroid update:** Storyline centroid = rolling weighted average of member article embeddings, with recent articles weighted higher (exponential decay, half-life = 14 days).
+  - **Storyline merging:** Nightly batch job compares all active storyline centroids. If two centroids have similarity > 0.85, merge them (combine articles, recompute centroid, concatenate summaries for human review).
+  - **Storyline lifecycle:** Storylines with no new articles for 30 days are marked inactive. They remain queryable but stop participating in centroid matching.
+  - **Storyline metadata:** Each storyline has a title (LLM-generated from its top-3 articles), summary (regenerated weekly), article count, first/last activity dates.
+  - **Thresholds (0.78 assignment, 0.85 merge) are configurable** and should be tuned empirically after accumulating ~500 articles.
   - Timeline view for each narrative
 - **Conversational Q&A:** `POST /ask`
   - RAG pipeline: embed question → retrieve relevant articles → LLM generates grounded answer with citations
@@ -211,9 +315,10 @@ ai-pulse/
 
 ### Phase 4 — MCP Server (Week 7–8)
 
-**Goal:** Your AI Pulse knowledge base is now accessible as an MCP server.
+**Goal:** Expand the minimal MCP server (shipped in Phase 2) into the full tool suite, with semantic search, narrative tools, and Q&A.
 
 **New components:**
+- **Full MCP server** — the Phase 2 server only exposed `search_articles` (text) and `get_digest`. Phase 4 upgrades `search_articles` to semantic search and adds the remaining tools, all powered by the ChromaDB + RAG infrastructure built in Phase 3:
 - **MCP server** using the Python `mcp` SDK:
   ```python
   @server.tool("search_articles")
